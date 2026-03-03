@@ -1,0 +1,144 @@
+php composer.phar require php-mqtt/client
+
+Tạo file config/mqtt.php
+	<?php
+
+	return [
+    'host' => env('MQTT_HOST', '127.0.0.1'),
+    'port' => env('MQTT_PORT', 1883),
+    'client_id' => env('MQTT_CLIENT_ID', 'reverb-websocket-signal-subscriber'),
+    'username' => env('MQTT_USERNAME', null),
+    'password' => env('MQTT_PASSWORD', null),
+    'keep_alive' => 60,
+];
+
+Thêm vào .env cấu hình sau
+MQTT_HOST=127.0.0.1
+MQTT_PORT=1881
+MQTT_CLIENT_ID=reverb-websocket-signal-subscriber
+
+Tạo mới command
+php artisan make:command MqttSubscribe
+
+Nội dung MqttSubscribe
+    namespace App\Console\Commands;
+
+    use App\Events\MessageSent;
+    use Illuminate\Console\Command;
+    use PhpMqtt\Client\MqttClient;
+    use PhpMqtt\Client\ConnectionSettings;
+
+    class MqttSubscribe extends Command
+    {
+        protected $signature = 'mqtt:start';
+        protected $description = 'Subscribe MQTT and forward to Reverb';
+        private $signalWildTopic = 'reverb-websocket/+/signal';
+
+        public function handle()
+        {
+            $topic = $this->signalWildTopic;
+
+            $client = new MqttClient(
+                config('mqtt.host'),
+                config('mqtt.port'),
+                config('mqtt.client_id')
+            );
+
+            $settings = (new ConnectionSettings)
+                ->setKeepAliveInterval(config('mqtt.keep_alive'));
+
+            $client->connect($settings, true);
+
+            $this->info('[INFO] MQTT connected');
+            $this->info("[INFO] Subscribing to: {$topic}");
+
+            $client->subscribe($topic, function ($topic, $message) {
+                $this->subscribeHandler($topic, $message);
+            }, 0);
+
+            $this->info('[INFO] Listening for messages...');
+            $client->loop(true);
+        }
+        private function subscribeHandler(string $topic, string $message): void
+        {
+            try {
+                if (trim($message) === '') {
+                    $this->warn("[ERROR] Empty message on topic: {$topic}");
+                    return;
+                }
+
+                $payload = json_decode($message, true, 512, JSON_THROW_ON_ERROR);
+
+                $redis_key = $payload['data']['redis_key'] ?? null;
+
+                if ($redis_key === null) {
+                    $this->line("[ERROR] Redis key is null");
+                    return;
+                }
+
+                $path = $payload['data']['path'] ?? null;
+
+                if ($path === null) {
+                    $this->warn('[ERROR] Path is null');
+                    return;
+                }
+
+                $timestamp = $payload['meta']['timestamp'] ?? null;
+
+                if ($timestamp === null) {
+                    $this->warn('[ERROR] Timestamp is null');
+                    return;
+                }
+
+                $from = $payload['meta']['from'] ?? null;
+
+                if ($from === null) {
+                    $this->warn('[ERROR] From is null');
+                    return;
+                }
+
+                broadcast(new MessageSent(json_encode([
+                    'from' => $from,
+                    'topic' => $topic,
+                    'redis_key'   => $redis_key,
+                    'path'  => $path,
+                    'timestamp'  => $timestamp,
+                ])));
+
+                $this->info(
+                    "[INFO] Received signal from: " . ($payload['meta']['from'] ?? 'unknown') . "\n" .
+                        "Topic: {$topic}\n" .
+                        "From: {$from}\n" .
+                        "Redis key: {$redis_key}\n" .
+                        "Path: {$path}\n" .
+                        "Timestamp: {$timestamp}"
+                );
+            } catch (\JsonException $e) {
+                $this->error('[ERROR] ' . $e->getMessage());
+            } catch (\Throwable $e) {
+                $this->error('[ERROR] ' . $e->getMessage());
+            }
+        }
+    }
+
+
+Chạy dịch vụ
+php artisan mqtt:start
+
+    Topic: reverb-websocket/+/signal
+    Mẫu signal
+    {
+        "meta": {
+            "from": "java-mqtt-signal-1882",
+            "channel": "reverb.websocket.redis.signal.chanel",
+            "event": "reverb.websocket.redis.signal.event",
+            "timestamp": 11111
+        },
+        "data": {
+            "redis_key": "agent:facade:+:sensor:temperatures",
+            "path": "health/ping"
+        }
+    }
+agent:facade:+:sensor:temperatures
+agent:facade:+:profile:hardware-profile
+... replace + with actual agent ID ...
